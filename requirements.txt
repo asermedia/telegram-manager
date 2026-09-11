@@ -1,3 +1,4 @@
 telethon==1.45.0
 python-dotenv==1.2.3
 qrcode==8.2
+pypng==0.20220715.0
