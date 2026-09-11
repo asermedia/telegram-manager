@@ -1,6 +1,8 @@
 import asyncio
 import io
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import qrcode
@@ -588,7 +590,29 @@ async def text_handler(event):
         return
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Telegram Manager is running")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    # Render provides PORT dynamically. Bind to 0.0.0.0 so the service is reachable.
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"Health server listening on 0.0.0.0:{port}")
+    server.serve_forever()
+
+
 async def main():
+    # Render Web Services require an HTTP listener on the assigned PORT.
+    threading.Thread(target=start_health_server, daemon=True).start()
+
     await bot.start(bot_token=BOT_TOKEN)
     print("Telegram Manager bot is running.")
     await bot.run_until_disconnected()
