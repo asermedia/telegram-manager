@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import qrcode
-from qrcode.image.svg import SvgPathImage
+from qrcode.image.pure import PyPNGImage
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
@@ -128,17 +128,19 @@ async def qr_login(user_id):
             qr_code = qrcode.QRCode(box_size=8, border=4)
             qr_code.add_data(qr.url)
             qr_code.make(fit=True)
-            img = qr_code.make_image(image_factory=SvgPathImage)
-            svg = img.to_string()
-            if isinstance(svg, str):
-                svg = svg.encode("utf-8")
-            buf = io.BytesIO(svg)
+            # Render as a real PNG image so Telegram displays the QR
+            # directly in the chat instead of as an SVG document.
+            img = qr_code.make_image(image_factory=PyPNGImage)
+            buf = io.BytesIO()
+            img.save(buf)
             buf.seek(0)
+            buf.name = "telegram_login_qr.png"
 
             await bot.send_file(
                 user_id,
                 buf,
-                file_name="telegram_login_qr.svg",
+                file_name="telegram_login_qr.png",
+                force_document=False,
                 caption=(
                     "📱 Scan this QR with Telegram:\n"
                     "Settings → Devices → Link Desktop Device\n\n"
