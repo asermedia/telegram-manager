@@ -19,11 +19,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
+OWNER_ID = os.getenv("OWNER_ID")
 
 if not BOT_TOKEN or not API_ID or not API_HASH:
     raise RuntimeError("BOT_TOKEN, API_ID and API_HASH must be set in .env")
 
 API_ID = int(API_ID)
+OWNER_ID = int(OWNER_ID) if OWNER_ID else 0
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION_DIR = BASE_DIR / "telethon_sessions"
@@ -50,19 +52,27 @@ def state_for(user_id):
             "selected": set(),
             "repeat": 1,
             "delay": 10,
+            "kick_group": None,
         },
     )
 
 
-def main_menu():
-    return [
+def is_owner(user_id):
+    return OWNER_ID != 0 and user_id == OWNER_ID
+
+
+def main_menu(user_id=None):
+    rows = [
         [Button.inline("🔐 Connect Telegram", b"connect")],
         [Button.inline("📋 My Groups", b"groups"),
          Button.inline("➕ Join Group", b"join")],
         [Button.inline("🚪 Leave Group", b"leave")],
         [Button.inline("📨 Message Sender", b"sender")],
-        [Button.inline("🔌 Disconnect", b"disconnect")],
     ]
+    if user_id is not None and is_owner(user_id):
+        rows.append([Button.inline("👮 Kick Member", b"kick")])
+    rows.append([Button.inline("🔌 Disconnect", b"disconnect")])
+    return rows
 
 
 async def get_client(user_id):
@@ -83,7 +93,7 @@ async def get_client(user_id):
 
 
 async def send_menu(event, text="Choose an option:"):
-    await event.respond(text, buttons=main_menu())
+    await event.respond(text, buttons=main_menu(event.sender_id))
 
 
 async def require_account(event):
@@ -118,7 +128,7 @@ async def qr_login(user_id):
                     user_id,
                     f"✅ Already connected as {me.first_name or 'Telegram user'} "
                     f"(ID: {me.id}).",
-                    buttons=main_menu(),
+                    buttons=main_menu(event.sender_id),
                 )
                 return
 
@@ -169,7 +179,7 @@ async def qr_login(user_id):
                 f"Name: {name}\n"
                 f"ID: {me.id}\n\n"
                 "Your Telegram account is now connected.",
-                buttons=main_menu(),
+                buttons=main_menu(event.sender_id),
             )
 
         except Exception as e:
@@ -177,7 +187,7 @@ async def qr_login(user_id):
                 user_id,
                 f"❌ Telegram login failed:\n`{type(e).__name__}: {e}`",
                 parse_mode="md",
-                buttons=main_menu(),
+                buttons=main_menu(event.sender_id),
             )
         finally:
             login_tasks.pop(user_id, None)
@@ -204,7 +214,7 @@ async def show_groups(event):
     st["groups"] = groups
 
     if not groups:
-        await event.respond("📋 No groups/supergroups found.", buttons=main_menu())
+        await event.respond("📋 No groups/supergroups found.", buttons=main_menu(event.sender_id))
         return
 
     # Keep selection valid after refreshing the list.
@@ -247,12 +257,12 @@ async def join_group(event, text):
             entity = await client.get_entity(username)
             await client(JoinChannelRequest(entity))
 
-        await event.respond("✅ Successfully joined the group/channel.", buttons=main_menu())
+        await event.respond("✅ Successfully joined the group/channel.", buttons=main_menu(event.sender_id))
     except Exception as e:
         await event.respond(
             f"❌ Couldn't join it:\n`{type(e).__name__}: {e}`",
             parse_mode="md",
-            buttons=main_menu(),
+            buttons=main_menu(event.sender_id),
         )
 
 
@@ -267,13 +277,50 @@ async def leave_group(event, text):
         value = value.strip("@/ ")
         entity = await client.get_entity(value)
         await client.delete_dialog(entity)
-        await event.respond("✅ Left the group/channel.", buttons=main_menu())
+        await event.respond("✅ Left the group/channel.", buttons=main_menu(event.sender_id))
     except Exception as e:
         await event.respond(
             f"❌ Couldn't leave it:\n`{type(e).__name__}: {e}`",
             parse_mode="md",
-            buttons=main_menu(),
+            buttons=main_menu(event.sender_id),
         )
+
+
+async def kick_menu(event):
+    user_id = event.sender_id
+    if not is_owner(user_id):
+        await event.respond("❌ This feature is restricted to the bot owner.", buttons=main_menu(user_id))
+        return
+
+    client = await require_account(event)
+    if client is None:
+        return
+
+    st = state_for(user_id)
+    groups = st.get("groups") or []
+    if not groups:
+        dialogs = await client.get_dialogs()
+        groups = []
+        for d in dialogs:
+            entity = d.entity
+            if isinstance(entity, Chat) or (isinstance(entity, Channel) and entity.megagroup):
+                groups.append((entity.id, d.name or "Unnamed group"))
+        st["groups"] = groups
+
+    if not groups:
+        await event.respond("📋 No groups/supergroups found.", buttons=main_menu(user_id))
+        return
+
+    rows = []
+    for i, (gid, name) in enumerate(groups[:80]):
+        rows.append([Button.inline(f"👮 {name[:45]}", f"kickgroup:{i}".encode())])
+    rows.append([Button.inline("🏠 Main Menu", b"menu")])
+
+    await event.respond(
+        "👮 <b>Kick Member</b>\n\nSelect the group where you want to remove a member.",
+        buttons=rows,
+        parse_mode="html",
+    )
 
 
 async def sender_menu(event):
@@ -324,7 +371,7 @@ async def start_sender(user_id):
         await bot.send_message(
             user_id,
             "❌ Select at least one group first.",
-            buttons=main_menu(),
+            buttons=main_menu(user_id),
         )
         return
 
@@ -439,7 +486,7 @@ async def callback_handler(event):
 
     if data == "menu":
         st["mode"] = None
-        await event.edit("🤖 <b>Telegram Manager</b>\n\nChoose an option:", buttons=main_menu(), parse_mode="html")
+        await event.edit("🤖 <b>Telegram Manager</b>\n\nChoose an option:", buttons=main_menu(event.sender_id), parse_mode="html")
 
     elif data == "connect":
         st["mode"] = None
@@ -482,6 +529,33 @@ async def callback_handler(event):
             parse_mode="html",
         )
 
+    elif data == "kick":
+        if not is_owner(user_id):
+            await event.answer("Owner only", alert=True)
+            return
+        st["mode"] = None
+        await event.edit("👮 Loading groups...")
+        await kick_menu(event)
+
+    elif data.startswith("kickgroup:"):
+        if not is_owner(user_id):
+            await event.answer("Owner only", alert=True)
+            return
+        try:
+            idx = int(data.split(":", 1)[1])
+            gid, name = st["groups"][idx]
+            st["kick_group"] = gid
+            st["mode"] = "kick_member"
+            await event.edit(
+                f"👮 <b>Remove member from:</b> {name}\n\n"
+                "Send the member's @username or numeric Telegram user ID.\n\n"
+                "⚠️ You must have admin permission to remove members.",
+                buttons=[[Button.inline("❌ Cancel", b"menu")]],
+                parse_mode="html",
+            )
+        except (ValueError, IndexError):
+            await event.edit("❌ Invalid group selection.", buttons=main_menu(user_id))
+
     elif data == "sender":
         st["mode"] = None
         await event.edit("📨 Loading sender...")
@@ -509,14 +583,14 @@ async def callback_handler(event):
     elif data == "stopsend":
         st["mode"] = None
         await stop_sender(user_id)
-        await event.edit("⏹ Sender stopped.", buttons=main_menu())
+        await event.edit("⏹ Sender stopped.", buttons=main_menu(user_id))
 
     elif data == "disconnect":
         st["mode"] = None
         await disconnect_user(user_id)
         await event.edit(
             "🔌 Telegram account disconnected and its local session was removed.",
-            buttons=main_menu(),
+            buttons=main_menu(event.sender_id),
         )
 
 
@@ -537,7 +611,7 @@ async def text_handler(event):
         client = clients.get(user_id)
         if client is None:
             st["mode"] = None
-            await event.respond("❌ Login session expired. Tap Connect Telegram again.", buttons=main_menu())
+            await event.respond("❌ Login session expired. Tap Connect Telegram again.", buttons=main_menu(user_id))
             return
 
         try:
@@ -548,7 +622,7 @@ async def text_handler(event):
                 f"🎉 Telegram connected successfully!\n\n"
                 f"Name: {me.first_name or 'Unknown'}\n"
                 f"ID: {me.id}",
-                buttons=main_menu(),
+                buttons=main_menu(event.sender_id),
             )
         except Exception as e:
             await event.respond(
@@ -567,6 +641,50 @@ async def text_handler(event):
         await leave_group(event, text)
         return
 
+    if mode == "kick_member":
+        if not is_owner(user_id):
+            st["mode"] = None
+            return
+
+        client = await require_account(event)
+        if client is None:
+            st["mode"] = None
+            return
+
+        group_id = st.get("kick_group")
+        if not group_id:
+            st["mode"] = None
+            await event.respond("❌ No group selected. Try again.", buttons=main_menu(user_id))
+            return
+
+        try:
+            target = text.strip()
+            if target.startswith("https://t.me/") or target.startswith("http://t.me/"):
+                target = target.rsplit("/", 1)[-1].strip("@")
+            else:
+                target = target.strip("@ ")
+
+            participant = await client.get_entity(int(target) if target.isdigit() else target)
+            group = await client.get_entity(group_id)
+            await client.kick_participant(group, participant)
+
+            st["mode"] = None
+            st["kick_group"] = None
+            name = getattr(participant, "first_name", None) or getattr(participant, "title", None) or "member"
+            await event.respond(
+                f"✅ Removed <b>{name}</b> from the group.",
+                buttons=main_menu(user_id),
+                parse_mode="html",
+            )
+        except FloodWaitError as e:
+            await event.respond(f"⏳ Telegram requires a {e.seconds}s wait before this action.")
+        except Exception as e:
+            await event.respond(
+                f"❌ Couldn't remove that member:\n`{type(e).__name__}: {e}`",
+                parse_mode="md",
+            )
+        return
+
     if mode == "repeat":
         try:
             value = int(text)
@@ -574,7 +692,7 @@ async def text_handler(event):
                 raise ValueError
             st["repeat"] = value
             st["mode"] = None
-            await event.respond(f"✅ Repeat count set to {value}.", buttons=main_menu())
+            await event.respond(f"✅ Repeat count set to {value}.", buttons=main_menu(user_id))
         except ValueError:
             await event.respond("❌ Enter a whole number from 1 to 100.")
         return
@@ -586,7 +704,7 @@ async def text_handler(event):
                 raise ValueError
             st["delay"] = value
             st["mode"] = None
-            await event.respond(f"✅ Delay set to {value} seconds.", buttons=main_menu())
+            await event.respond(f"✅ Delay set to {value} seconds.", buttons=main_menu(user_id))
         except ValueError:
             await event.respond("❌ Enter seconds from 10 to 86400.")
         return
