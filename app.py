@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +31,21 @@ OWNER_ID = int(OWNER_ID) if OWNER_ID else 0
 BASE_DIR = Path(__file__).resolve().parent
 SESSION_DIR = BASE_DIR / "telethon_sessions"
 SESSION_DIR.mkdir(exist_ok=True)
+BLOCKED_USERS_FILE = BASE_DIR / "blocked_users.json"
+
+try:
+    BLOCKED_USERS = {int(x) for x in json.loads(BLOCKED_USERS_FILE.read_text())}
+except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+    BLOCKED_USERS = set()
+
+
+def save_blocked_users():
+    BLOCKED_USERS_FILE.write_text(json.dumps(sorted(BLOCKED_USERS)))
+
+
+def is_blocked(user_id):
+    return user_id in BLOCKED_USERS and not is_owner(user_id)
+
 
 # One lightweight Telethon client handles the bot UI.
 bot = TelegramClient(str(BASE_DIR / "bot_session"), API_ID, API_HASH)
@@ -70,7 +86,7 @@ def main_menu(user_id=None):
         [Button.inline("📨 Message Sender", b"sender")],
     ]
     if user_id is not None and is_owner(user_id):
-        rows.append([Button.inline("👮 Kick Member", b"kick")])
+        rows.append([Button.inline("🚫 Remove Bot User", b"user_admin")])
     rows.append([Button.inline("🔌 Disconnect", b"disconnect")])
     return rows
 
@@ -286,41 +302,40 @@ async def leave_group(event, text):
         )
 
 
-async def kick_menu(event):
+async def user_admin_menu(event):
     user_id = event.sender_id
     if not is_owner(user_id):
         await event.respond("❌ This feature is restricted to the bot owner.", buttons=main_menu(user_id))
         return
 
-    client = await require_account(event)
-    if client is None:
-        return
-
-    st = state_for(user_id)
-    groups = st.get("groups") or []
-    if not groups:
-        dialogs = await client.get_dialogs()
-        groups = []
-        for d in dialogs:
-            entity = d.entity
-            if isinstance(entity, Chat) or (isinstance(entity, Channel) and entity.megagroup):
-                groups.append((entity.id, d.name or "Unnamed group"))
-        st["groups"] = groups
-
-    if not groups:
-        await event.respond("📋 No groups/supergroups found.", buttons=main_menu(user_id))
-        return
-
-    rows = []
-    for i, (gid, name) in enumerate(groups[:80]):
-        rows.append([Button.inline(f"👮 {name[:45]}", f"kickgroup:{i}".encode())])
-    rows.append([Button.inline("🏠 Main Menu", b"menu")])
-
+    blocked = len(BLOCKED_USERS)
     await event.respond(
-        "👮 <b>Kick Member</b>\n\nSelect the group where you want to remove a member.",
-        buttons=rows,
+        "👮 <b>Bot User Management</b>\n\n"
+        f"Blocked users: <b>{blocked}</b>\n\n"
+        "🚫 Remove User — permanently revoke their access to this bot.\n"
+        "♻️ Restore User — give a previously removed user access again.",
+        buttons=[
+            [Button.inline("🚫 Remove User", b"remove_user"),
+             Button.inline("♻️ Restore User", b"restore_user")],
+            [Button.inline("🏠 Main Menu", b"menu")],
+        ],
         parse_mode="html",
     )
+
+
+async def remove_bot_user(owner_id, target_id):
+    if not is_owner(owner_id):
+        return False, "❌ Owner only."
+    if target_id == OWNER_ID:
+        return False, "❌ You cannot remove the bot owner."
+
+    BLOCKED_USERS.add(target_id)
+    save_blocked_users()
+
+    # Stop any running sender and remove the user's linked Telegram session.
+    await stop_sender(target_id)
+    await disconnect_user(target_id)
+    return True, f"✅ Bot access removed for user <code>{target_id}</code>."
 
 
 async def sender_menu(event):
@@ -469,6 +484,10 @@ async def disconnect_user(user_id):
 
 @bot.on(events.NewMessage(pattern=r"^/start$"))
 async def start_handler(event):
+    if is_blocked(event.sender_id):
+        await event.respond("🚫 Your access to this bot has been revoked.")
+        return
+
     state_for(event.sender_id)["mode"] = None
     await send_menu(
         event,
@@ -480,6 +499,11 @@ async def start_handler(event):
 async def callback_handler(event):
     user_id = event.sender_id
     data = event.data.decode(errors="ignore")
+
+    if is_blocked(user_id):
+        await event.answer("Access revoked", alert=True)
+        return
+
     st = state_for(user_id)
 
     await event.answer()
@@ -529,32 +553,37 @@ async def callback_handler(event):
             parse_mode="html",
         )
 
-    elif data == "kick":
+    elif data == "user_admin":
         if not is_owner(user_id):
             await event.answer("Owner only", alert=True)
             return
         st["mode"] = None
-        await event.edit("👮 Loading groups...")
-        await kick_menu(event)
+        await user_admin_menu(event)
 
-    elif data.startswith("kickgroup:"):
+    elif data == "remove_user":
         if not is_owner(user_id):
             await event.answer("Owner only", alert=True)
             return
-        try:
-            idx = int(data.split(":", 1)[1])
-            gid, name = st["groups"][idx]
-            st["kick_group"] = gid
-            st["mode"] = "kick_member"
-            await event.edit(
-                f"👮 <b>Remove member from:</b> {name}\n\n"
-                "Send the member's @username or numeric Telegram user ID.\n\n"
-                "⚠️ You must have admin permission to remove members.",
-                buttons=[[Button.inline("❌ Cancel", b"menu")]],
-                parse_mode="html",
-            )
-        except (ValueError, IndexError):
-            await event.edit("❌ Invalid group selection.", buttons=main_menu(user_id))
+        st["mode"] = "remove_bot_user"
+        await event.edit(
+            "🚫 <b>Remove Bot User</b>\n\n"
+            "Send the Telegram user ID of the person whose access you want to revoke.\n\n"
+            "Their bot access will be blocked and their linked Telegram session will be disconnected.",
+            buttons=[[Button.inline("❌ Cancel", b"user_admin")]],
+            parse_mode="html",
+        )
+
+    elif data == "restore_user":
+        if not is_owner(user_id):
+            await event.answer("Owner only", alert=True)
+            return
+        st["mode"] = "restore_bot_user"
+        await event.edit(
+            "♻️ <b>Restore Bot User</b>\n\n"
+            "Send the Telegram user ID of the person you want to allow again.",
+            buttons=[[Button.inline("❌ Cancel", b"user_admin")]],
+            parse_mode="html",
+        )
 
     elif data == "sender":
         st["mode"] = None
@@ -641,46 +670,50 @@ async def text_handler(event):
         await leave_group(event, text)
         return
 
-    if mode == "kick_member":
+    if mode == "remove_bot_user":
         if not is_owner(user_id):
             st["mode"] = None
             return
 
-        client = await require_account(event)
-        if client is None:
+        try:
+            target_id = int(text.strip())
+            if target_id <= 0:
+                raise ValueError
+            ok, message = await remove_bot_user(user_id, target_id)
             st["mode"] = None
-            return
+            await event.respond(message, buttons=main_menu(user_id), parse_mode="html")
+        except ValueError:
+            await event.respond("❌ Enter a valid numeric Telegram user ID.")
+        except Exception as e:
+            await event.respond(
+                f"❌ Couldn't remove that user:\n`{type(e).__name__}: {e}`",
+                parse_mode="md",
+            )
+        return
 
-        group_id = st.get("kick_group")
-        if not group_id:
+    if mode == "restore_bot_user":
+        if not is_owner(user_id):
             st["mode"] = None
-            await event.respond("❌ No group selected. Try again.", buttons=main_menu(user_id))
             return
 
         try:
-            target = text.strip()
-            if target.startswith("https://t.me/") or target.startswith("http://t.me/"):
-                target = target.rsplit("/", 1)[-1].strip("@")
-            else:
-                target = target.strip("@ ")
-
-            participant = await client.get_entity(int(target) if target.isdigit() else target)
-            group = await client.get_entity(group_id)
-            await client.kick_participant(group, participant)
-
+            target_id = int(text.strip())
+            if target_id <= 0:
+                raise ValueError
+            BLOCKED_USERS.discard(target_id)
+            save_blocked_users()
             st["mode"] = None
-            st["kick_group"] = None
-            name = getattr(participant, "first_name", None) or getattr(participant, "title", None) or "member"
             await event.respond(
-                f"✅ Removed <b>{name}</b> from the group.",
+                f"♻️ Bot access restored for user <code>{target_id}</code>.\n"
+                "They will need to connect their Telegram account again.",
                 buttons=main_menu(user_id),
                 parse_mode="html",
             )
-        except FloodWaitError as e:
-            await event.respond(f"⏳ Telegram requires a {e.seconds}s wait before this action.")
+        except ValueError:
+            await event.respond("❌ Enter a valid numeric Telegram user ID.")
         except Exception as e:
             await event.respond(
-                f"❌ Couldn't remove that member:\n`{type(e).__name__}: {e}`",
+                f"❌ Couldn't restore that user:\n`{type(e).__name__}: {e}`",
                 parse_mode="md",
             )
         return
